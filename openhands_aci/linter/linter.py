@@ -1,6 +1,7 @@
 import os
 from collections import defaultdict
 from difflib import SequenceMatcher
+from typing import Any, Dict, List, Optional
 
 from ..linter.base import BaseLinter, LinterException, LintResult
 from ..linter.impl.python import PythonLinter
@@ -120,3 +121,45 @@ class DefaultLinter(BaseLinter):
         # 6. Sort errors by line and column
         selected_errors.sort(key=lambda x: (x.line, x.column))
         return selected_errors
+
+
+# Convenience function for linting files
+def lint_file(file_path: str, **kwargs) -> Dict[str, Any]:
+    """Lint a file and return the results.
+    
+    Args:
+        file_path: Path to the file to lint
+        **kwargs: Additional arguments
+        
+    Returns:
+        Dictionary with linting results
+    """
+    linter = DefaultLinter()
+    
+    try:
+        # Lint the file
+        lint_results = linter.lint(file_path)
+        
+        # Convert LintResult objects to dictionaries
+        issues = []
+        for result in lint_results:
+            issues.append({
+                "line": result.line,
+                "column": result.column,
+                "code": result.code,
+                "message": result.message,
+                "severity": result.severity
+            })
+        
+        return {
+            "status": "success",
+            "file_path": file_path,
+            "issues": issues,
+            "count": len(issues)
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "file_path": file_path,
+            "message": str(e)
+        }

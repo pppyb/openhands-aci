@@ -4,6 +4,16 @@ Part of this Linter module is adapted from Aider (Apache 2.0 License, [original 
 """
 
 from .base import LintResult
-from .linter import DefaultLinter
+from .linter import DefaultLinter, lint_file
 
-__all__ = ['DefaultLinter', 'LintResult']
+# Import enhanced linter
+from .enhanced_linter import (
+    EnhancedLinter,
+    lint_with_context,
+    suggest_fixes
+)
+
+__all__ = [
+    'DefaultLinter', 'LintResult', 'lint_file',
+    'EnhancedLinter', 'lint_with_context', 'suggest_fixes'
+]
