@@ -6,9 +6,20 @@ from .exceptions import ToolError
 from .file_cache import FileCache
 from .results import ToolResult
 
+# Import enhanced editor
+from .enhanced_editor import (
+    EnhancedEditor, 
+    edit_with_context, 
+    create_with_context, 
+    str_replace_with_context
+)
+
 _GLOBAL_EDITOR = OHEditor()
 
-__all__ = ['Command', 'OHEditor', 'ToolError', 'ToolResult', 'FileCache', 'file_editor']
+__all__ = [
+    'Command', 'OHEditor', 'ToolError', 'ToolResult', 'FileCache', 'file_editor',
+    'EnhancedEditor', 'edit_with_context', 'create_with_context', 'str_replace_with_context'
+]
 
 
 def _make_api_tool_result(tool_result: ToolResult) -> str:
