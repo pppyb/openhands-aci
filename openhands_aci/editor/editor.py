@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from openhands_aci.linter import DefaultLinter
+from openhands_aci.tools.code_search_tool import code_search_tool
 from openhands_aci.utils.shell import run_shell_cmd
 
 from .config import SNIPPET_CONTEXT_WINDOW
@@ -20,6 +21,7 @@ Command = Literal[
     'str_replace',
     'insert',
     'undo_edit',
+    'code_search',
     # 'jump_to_definition', TODO:
     # 'find_references' TODO:
 ]
@@ -47,7 +49,7 @@ class OHEditor:
         self,
         *,
         command: Command,
-        path: str,
+        path: str | None = None,
         file_text: str | None = None,
         view_range: list[int] | None = None,
         old_str: str | None = None,
@@ -56,6 +58,18 @@ class OHEditor:
         enable_linting: bool = False,
         **kwargs,
     ) -> CLIResult:
+        if command == 'code_search':
+            result = code_search_tool(command='search', **kwargs)
+            return CLIResult(
+                output=str(result),
+                prev_exist=True,
+                path='code_search_index',
+                old_content='',
+                new_content='',
+            )
+
+        if not path:
+            raise EditorToolParameterMissingError(command, 'path')
         _path = Path(path)
         self.validate_path(command, _path)
         if command == 'view':
