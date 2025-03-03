@@ -5,6 +5,9 @@ __pycache__/
 
 # Code search indices
 code_search_index/
+.code_search_index/
+*.faiss
+documents.pkl
 
 # C extensions
 *.so

@@ -59,11 +59,42 @@ class OHEditor:
         **kwargs,
     ) -> CLIResult:
         if command == 'code_search':
-            result = code_search_tool(command='search', **kwargs)
+            query = kwargs.get('query')
+            if not query:
+                raise EditorToolParameterMissingError(command, 'query')
+
+            repo_path = kwargs.get('repo_path')
+            save_dir = kwargs.get('save_dir')
+            extensions = kwargs.get('extensions')
+            k = kwargs.get('k', 5)
+
+            result = code_search_tool(
+                query=query,
+                repo_path=repo_path,
+                save_dir=save_dir,
+                extensions=extensions,
+                k=k,
+            )
+
+            # Format the output for better readability
+            if result['status'] == 'success':
+                output = f"Code search results for query: '{query}'\n\n"
+                for i, res in enumerate(result['results'], 1):
+                    output += f"Result {i}: {res['file']} (Score: {res['score']})\n"
+                    output += '-' * 80 + '\n'
+                    # Show a snippet of the content
+                    content_lines = res['content'].split('\n')
+                    snippet = '\n'.join(content_lines[: min(10, len(content_lines))])
+                    if len(content_lines) > 10:
+                        snippet += '\n... (content truncated)'
+                    output += snippet + '\n\n'
+            else:
+                output = f"Error: {result['message']}"
+
             return CLIResult(
-                output=str(result),
+                output=output,
                 prev_exist=True,
-                path='code_search_index',
+                path='code_search_results',
                 old_content='',
                 new_content='',
             )
