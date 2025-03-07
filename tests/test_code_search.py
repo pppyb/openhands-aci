@@ -23,7 +23,7 @@ def test_repo():
         files = {
             'main.py': 'def hello():\n    print("Hello, World!")',
             'utils/helper.py': 'def add(a, b):\n    return a + b',
-            'README.md': '# Test Repository\nThis is a test.',
+            'README.md': '# Test Repository\n This is a test.',
         }
 
         for path, content in files.items():
