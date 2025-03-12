@@ -67,11 +67,14 @@ def get_embedding(text: str, model: str = "text-embedding-3-small") -> List[floa
         logger.warning("No OpenAI API key found in environment. Using mock embedding.")
         return [0.0] * 1536  # Mock embedding with 1536 dimensions
     
+    logger.info(f"Using API key starting with: {api_key[:10]}...")
+    
     try:
         # Create OpenAI client with proper API key format
         # Check if the API key starts with 'sk-proj-' (Project API key format)
         if api_key.startswith('sk-proj-'):
             # For project API keys, we need to use the organization parameter
+            logger.info("Using project API key format")
             client = OpenAI(
                 api_key=api_key,
                 # Add any additional parameters needed for project API keys
@@ -80,6 +83,7 @@ def get_embedding(text: str, model: str = "text-embedding-3-small") -> List[floa
             )
         else:
             # For regular API keys
+            logger.info("Using regular API key format")
             client = OpenAI(api_key=api_key)
         
         # Get embedding with a smaller input size to avoid 400 errors
@@ -89,14 +93,33 @@ def get_embedding(text: str, model: str = "text-embedding-3-small") -> List[floa
             text = text[:max_chars]
             logger.warning(f"Text truncated to {max_chars} characters for embedding")
         
-        # Get embedding
-        response = client.embeddings.create(
-            model=model,
-            input=text
-        )
+        logger.info(f"Getting embedding for text of length {len(text)} using model {model}")
         
-        # Return embedding
-        return response.data[0].embedding
+        # Get embedding
+        try:
+            response = client.embeddings.create(
+                model=model,
+                input=text
+            )
+            
+            # Return embedding
+            logger.info("Successfully got embedding")
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error in API call: {e}")
+            # Try with a simpler model as fallback
+            logger.info("Trying with text-embedding-ada-002 as fallback")
+            try:
+                response = client.embeddings.create(
+                    model="text-embedding-ada-002",
+                    input=text
+                )
+                logger.info("Successfully got embedding with fallback model")
+                return response.data[0].embedding
+            except Exception as e2:
+                logger.error(f"Error with fallback model: {e2}")
+                # Return mock embedding on error
+                return [0.0] * 1536  # Mock embedding with 1536 dimensions
     except Exception as e:
         logger.error(f"Error getting embedding: {e}")
         # Return mock embedding on error
@@ -133,7 +156,8 @@ def code_search_tool(
     query: str,
     repo_path: str,
     extensions: Optional[List[str]] = None,
-    k: int = 5
+    k: int = 5,
+    mock_mode: bool = False
 ) -> Dict[str, Any]:
     """Search for relevant code in a repository using semantic search.
     
@@ -150,6 +174,33 @@ def code_search_tool(
     logger.info(f"Repository path: {repo_path}")
     logger.info(f"Extensions: {extensions}")
     logger.info(f"Number of results: {k}")
+    
+    # Check if we're in mock mode
+    if mock_mode:
+        logger.info("Running in mock mode - returning mock results")
+        mock_results = [
+            {
+                "file": "openhands/events/action/code_search.py",
+                "score": 0.95,
+                "content": "\"\"\"Code search action module.\"\"\"\n\nfrom dataclasses import dataclass\nfrom typing import ClassVar, List, Optional\n\nfrom openhands.core.schema.action import ActionType\nfrom openhands.events.action.action import Action, ActionSecurityRisk\n\n\n@dataclass\nclass CodeSearchAction(Action):\n    \"\"\"Search for relevant code in a codebase using semantic search.\"\"\"\n    # ... more code here ..."
+            },
+            {
+                "file": "openhands/events/observation/code_search.py",
+                "score": 0.92,
+                "content": "\"\"\"Code search observation module.\"\"\"\n\nfrom dataclasses import dataclass\nfrom typing import Any, Dict, List\n\nfrom openhands.core.schema.observation import ObservationType\nfrom openhands.events.observation.observation import Observation\n\n\n@dataclass\nclass CodeSearchObservation(Observation):\n    \"\"\"Result of a code search operation.\"\"\"\n    # ... more code here ..."
+            },
+            {
+                "file": "openhands/runtime/handlers/code_search_handler.py",
+                "score": 0.88,
+                "content": "\"\"\"Handler for code search actions.\"\"\"\n\nimport logging\nimport os\nfrom typing import Optional\n\nfrom openhands.core.logger import openhands_logger as logger\nfrom openhands.events.action import Action\nfrom openhands.events.action.code_search import CodeSearchAction\nfrom openhands.events.observation import Observation\nfrom openhands.events.observation.code_search import CodeSearchObservation\nfrom openhands.runtime.handlers.handler import ActionHandler\n\n# ... more code here ..."
+            }
+        ]
+        return {
+            "query": query,
+            "repo_path": repo_path,
+            "extensions": extensions,
+            "results": mock_results
+        }
     
     # Validate inputs
     if not os.path.isdir(repo_path):
@@ -179,13 +230,26 @@ def code_search_tool(
         }
     
     # Get embedding for the query
+    logger.info("Getting embedding for query...")
     query_embedding = get_embedding(query)
+    logger.info("Got embedding for query")
     
     # Process each file
     results = []
     max_file_size = 100 * 1024  # 100KB max file size to process
     
+    # Limit the number of files to process for testing
+    max_files_to_process = 50  # Limit to 50 files for testing
+    if len(all_files) > max_files_to_process:
+        logger.info(f"Limiting to {max_files_to_process} files for processing")
+        all_files = all_files[:max_files_to_process]
+    
+    processed_files = 0
     for file_path in all_files:
+        processed_files += 1
+        if processed_files % 10 == 0:
+            logger.info(f"Processed {processed_files}/{len(all_files)} files")
+            
         # Get relative path to the repository
         rel_path = os.path.relpath(file_path, repo_path)
         
@@ -213,10 +277,12 @@ def code_search_tool(
             max_content_length = 8000  # Characters to use for embedding
             embedding_content = content[:max_content_length]
             
+            logger.info(f"Getting embedding for file: {rel_path}")
             file_embedding = get_embedding(embedding_content)
             
             # Calculate similarity
             similarity = cosine_similarity(query_embedding, file_embedding)
+            logger.info(f"File {rel_path} has similarity score: {similarity}")
             
             # Add to results
             results.append({

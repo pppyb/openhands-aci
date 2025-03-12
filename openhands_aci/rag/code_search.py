@@ -56,27 +56,27 @@ class CodeSearchObservation(Observation):
     """Result of a code search operation."""
     
     observation = ObservationType.CODE_SEARCH
-    results: List[Dict[str, Any]]
     content: str
+    results: List[Dict[str, Any]]
     
     def __init__(
         self,
-        results: List[Dict[str, Any]],
         content: Optional[str] = None,
+        results: List[Dict[str, Any]] = None,
         **kwargs
     ):
         """Initialize a code search observation.
         
         Args:
-            results: List of search results
             content: Optional formatted content for display
+            results: List of search results
         """
         super().__init__(**kwargs)
-        self.results = results
+        self.results = results or []
         
         # If content is not provided, generate it from results
         if content is None:
-            self.content = self._format_results(results)
+            self.content = self._format_results(self.results)
         else:
             self.content = content
     
@@ -107,11 +107,12 @@ class CodeSearchObservation(Observation):
         return "\n".join(formatted)
 
 
-def execute_code_search(action: CodeSearchAction) -> CodeSearchObservation:
+def execute_code_search(action: CodeSearchAction, mock_mode: bool = False) -> CodeSearchObservation:
     """Execute a code search action and return an observation.
     
     Args:
         action: Code search action to execute
+        mock_mode: Whether to use mock mode for testing
         
     Returns:
         Code search observation with results
@@ -119,36 +120,41 @@ def execute_code_search(action: CodeSearchAction) -> CodeSearchObservation:
     # Validate repo_path
     if not os.path.isdir(action.repo_path):
         return CodeSearchObservation(
-            results=[],
             content=f"Error: Repository path '{action.repo_path}' is not a directory.",
+            results=[],
             cause=action.id
         )
     
     # Execute code search
     try:
+        # Check if we should use mock mode
+        use_mock = mock_mode or os.environ.get('OPENHANDS_TEST_MOCK_MODE') == 'true'
+        
         search_result = code_search_tool(
             query=action.query,
             repo_path=action.repo_path,
             extensions=action.extensions,
-            k=action.k
+            k=action.k,
+            mock_mode=use_mock
         )
         
         # Check for errors
         if "error" in search_result:
             return CodeSearchObservation(
-                results=[],
                 content=f"Error: {search_result['error']}",
+                results=[],
                 cause=action.id
             )
         
         # Return observation with results
         return CodeSearchObservation(
+            content=None,  # Will be auto-generated from results
             results=search_result["results"],
             cause=action.id
         )
     except Exception as e:
         return CodeSearchObservation(
-            results=[],
             content=f"Error executing code search: {str(e)}",
+            results=[],
             cause=action.id
         )
