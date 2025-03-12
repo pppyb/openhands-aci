@@ -6,21 +6,182 @@ This module provides a tool for semantic code search in a repository.
 import os
 import glob
 import json
+import pickle
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# logging.basicConfig(level=logging.INFO, 
+#                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Try to import OpenAI for embeddings
+# Try to import required libraries
 try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    logger.warning("OpenAI package not available. Using mock embeddings.")
-    OPENAI_AVAILABLE = False
+    import faiss
+    import numpy as np
+    import torch
+    from sentence_transformers import SentenceTransformer
+    from git import Repo
+    from git.exc import InvalidGitRepositoryError
+    DEPENDENCIES_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Required dependency not available: {e}. Using mock mode.")
+    DEPENDENCIES_AVAILABLE = False
+
+class CodeSearchIndex:
+    def __init__(self, embedding_model: Optional[str] = None):
+        """Initialize the code search index.
+
+        Args:
+            embedding_model: Name or path of the sentence transformer model to use.
+                           If None, will use the model specified in EMBEDDING_MODEL env var.
+        """
+        if not DEPENDENCIES_AVAILABLE:
+            logger.warning("Dependencies not available. CodeSearchIndex will operate in mock mode.")
+            return
+            
+        self.embedding_model = embedding_model or os.getenv(
+            'EMBEDDING_MODEL', 'BAAI/bge-base-en-v1.5'
+        )
+        self.model = SentenceTransformer(self.embedding_model)
+        self.index: Optional[faiss.IndexFlatIP] = None
+        self.documents: List[Dict[str, Any]] = []
+        self.doc_ids: List[str] = []
+
+    def _embed_text(self, text: str) -> np.ndarray:
+        """Embed a single text string."""
+        if not DEPENDENCIES_AVAILABLE:
+            # Return mock embedding if dependencies aren't available
+            return np.zeros(768)  # Mock embedding
+            
+        with torch.no_grad():
+            embedding = self.model.encode(text, convert_to_tensor=True)
+            return embedding.cpu().numpy()
+
+    def _embed_batch(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+        """Embed a batch of text strings."""
+        if not DEPENDENCIES_AVAILABLE:
+            # Return mock embeddings if dependencies aren't available
+            return np.zeros((len(texts), 768))  # Mock embeddings
+            
+        embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            with torch.no_grad():
+                batch_embeddings = self.model.encode(batch, convert_to_tensor=True)
+                embeddings.append(batch_embeddings.cpu().numpy())
+        return np.vstack(embeddings)
+
+    def add_documents(self, documents: List[Dict[str, Any]], batch_size: int = 32):
+        """Add documents to the index.
+
+        Args:
+            documents: List of document dictionaries with 'id' and 'content' keys
+            batch_size: Batch size for embedding generation
+        """
+        if not DEPENDENCIES_AVAILABLE:
+            self.documents.extend(documents)
+            self.doc_ids.extend([doc['id'] for doc in documents])
+            return
+            
+        texts = [doc['content'] for doc in documents]
+        embeddings = self._embed_batch(texts, batch_size)
+
+        if self.index is None:
+            self.index = faiss.IndexFlatIP(embeddings.shape[1])
+
+        self.index.add(embeddings)
+        self.documents.extend(documents)
+        self.doc_ids.extend([doc['id'] for doc in documents])
+
+    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Search the index with a query string.
+
+        Args:
+            query: The search query
+            k: Number of results to return
+
+        Returns:
+            List of document dictionaries with scores
+        """
+        if not DEPENDENCIES_AVAILABLE or not self.documents:
+            # Return mock results or empty list if no documents
+            return []
+            
+        if self.index is None:
+            raise ValueError('Index is not initialized. Add documents first.')
+            
+        query_embedding = self._embed_text(query)
+        scores, indices = self.index.search(query_embedding.reshape(1, -1), k)
+
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx < 0 or idx >= len(self.documents):
+                continue
+            doc = self.documents[idx].copy()
+            doc['score'] = float(score)
+            results.append(doc)
+
+        return results
+
+    def save(self, directory: str):
+        """Save the index and documents to disk.
+
+        Args:
+            directory: Directory to save the index in
+        """
+        if not DEPENDENCIES_AVAILABLE:
+            logger.warning("Dependencies not available. Cannot save index.")
+            return
+            
+        dir_path = Path(directory)
+        dir_path.mkdir(parents=True, exist_ok=True)
+
+        # Save the Faiss index
+        if self.index is not None:
+            faiss.write_index(self.index, str(dir_path / 'index.faiss'))
+
+        # Save documents and metadata
+        with open(dir_path / 'documents.pkl', 'wb') as f:
+            pickle.dump(
+                {
+                    'documents': self.documents,
+                    'doc_ids': self.doc_ids,
+                    'embedding_model': self.embedding_model,
+                },
+                f,
+            )
+
+    @classmethod
+    def load(cls, directory: str) -> 'CodeSearchIndex':
+        """Load an index from disk.
+
+        Args:
+            directory: Directory containing the saved index
+
+        Returns:
+            Loaded CodeSearchIndex instance
+        """
+        if not DEPENDENCIES_AVAILABLE:
+            logger.warning("Dependencies not available. Returning empty index instance.")
+            return cls()
+            
+        dir_path = Path(directory)
+
+        # Load metadata
+        with open(dir_path / 'documents.pkl', 'rb') as f:
+            data = pickle.load(f)
+
+        # Create instance with same model
+        instance = cls(embedding_model=data['embedding_model'])
+        instance.documents = data['documents']
+        instance.doc_ids = data['doc_ids']
+
+        # Load Faiss index
+        instance.index = faiss.read_index(str(dir_path / 'index.faiss'))
+
+        return instance
 
 def get_file_content(file_path: str) -> str:
     """Get the content of a file.
@@ -46,111 +207,121 @@ def get_file_content(file_path: str) -> str:
         logger.warning(f"Could not read file {file_path}: {e}")
         return ""
 
-def get_embedding(text: str, model: str = "text-embedding-3-small") -> List[float]:
-    """Get embedding for a text using OpenAI API.
-    
-    Args:
-        text: Text to get embedding for
-        model: OpenAI embedding model to use
-        
-    Returns:
-        Embedding as a list of floats
-    """
-    if not OPENAI_AVAILABLE:
-        # Return a mock embedding if OpenAI is not available
-        logger.warning("Using mock embedding as OpenAI is not available")
-        return [0.0] * 1536  # Mock embedding with 1536 dimensions
-    
-    # Get API key from environment
-    api_key = os.environ.get('OPENAI_API_KEY')
-    if not api_key:
-        logger.warning("No OpenAI API key found in environment. Using mock embedding.")
-        return [0.0] * 1536  # Mock embedding with 1536 dimensions
-    
-    logger.info(f"Using API key starting with: {api_key[:10]}...")
-    
-    try:
-        # Create OpenAI client with proper API key format
-        # Check if the API key starts with 'sk-proj-' (Project API key format)
-        if api_key.startswith('sk-proj-'):
-            # For project API keys, we need to use the organization parameter
-            logger.info("Using project API key format")
-            client = OpenAI(
-                api_key=api_key,
-                # Add any additional parameters needed for project API keys
-                max_retries=3,
-                timeout=30.0
-            )
-        else:
-            # For regular API keys
-            logger.info("Using regular API key format")
-            client = OpenAI(api_key=api_key)
-        
-        # Get embedding with a smaller input size to avoid 400 errors
-        # Truncate text if it's too long (OpenAI has token limits)
-        max_chars = 8000  # A conservative limit to avoid token limit issues
-        if len(text) > max_chars:
-            text = text[:max_chars]
-            logger.warning(f"Text truncated to {max_chars} characters for embedding")
-        
-        logger.info(f"Getting embedding for text of length {len(text)} using model {model}")
-        
-        # Get embedding
-        try:
-            response = client.embeddings.create(
-                model=model,
-                input=text
-            )
-            
-            # Return embedding
-            logger.info("Successfully got embedding")
-            return response.data[0].embedding
-        except Exception as e:
-            logger.error(f"Error in API call: {e}")
-            # Try with a simpler model as fallback
-            logger.info("Trying with text-embedding-ada-002 as fallback")
-            try:
-                response = client.embeddings.create(
-                    model="text-embedding-ada-002",
-                    input=text
-                )
-                logger.info("Successfully got embedding with fallback model")
-                return response.data[0].embedding
-            except Exception as e2:
-                logger.error(f"Error with fallback model: {e2}")
-                # Return mock embedding on error
-                return [0.0] * 1536  # Mock embedding with 1536 dimensions
-    except Exception as e:
-        logger.error(f"Error getting embedding: {e}")
-        # Return mock embedding on error
-        return [0.0] * 1536  # Mock embedding with 1536 dimensions
+def _get_files_from_repo(
+    repo_path: str, extensions: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """Get all files from a git repository.
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Calculate cosine similarity between two vectors.
-    
     Args:
-        a: First vector
-        b: Second vector
-        
+        repo_path: Path to the git repository
+        extensions: List of file extensions to include (e.g. ['.py', '.js'])
+                  If None, includes all files
+
     Returns:
-        Cosine similarity as a float between -1 and 1
+        List of document dictionaries with 'id' and 'content' keys
     """
-    # Check if vectors have the same length
-    if len(a) != len(b):
-        raise ValueError(f"Vectors must have the same length, got {len(a)} and {len(b)}")
+    if DEPENDENCIES_AVAILABLE:
+        try:
+            # Verify it's a git repo
+            _ = Repo(repo_path)
+        except InvalidGitRepositoryError:
+            logger.warning(f'{repo_path} is not a valid git repository, proceeding without git validation')
     
-    # Calculate dot product
-    dot_product = sum(x * y for x, y in zip(a, b))
-    
-    # Calculate magnitudes
-    magnitude_a = sum(x * x for x in a) ** 0.5
-    magnitude_b = sum(x * x for x in b) ** 0.5
-    
-    # Calculate cosine similarity
-    if magnitude_a == 0 or magnitude_b == 0:
-        return 0.0
-    
-    return dot_product / (magnitude_a * magnitude_b)
+    documents = []
+    repo_path_obj = Path(repo_path)
+
+    for root, _, files in os.walk(repo_path_obj):
+        if '.git' in root:
+            continue
+
+        for file in files:
+            if extensions and not any(file.endswith(ext) for ext in extensions):
+                continue
+
+            file_path = Path(root) / file
+            try:
+                content = get_file_content(str(file_path))
+                if not content.strip():
+                    continue
+            except Exception:
+                continue
+
+            rel_path = str(file_path.relative_to(repo_path_obj))
+            documents.append(
+                {'id': rel_path, 'content': content, 'path': rel_path}
+            )
+
+    return documents
+
+def initialize_code_search(
+    repo_path: str,
+    save_dir: str,
+    extensions: Optional[List[str]] = None,
+    embedding_model: Optional[str] = None,
+    batch_size: int = 32,
+) -> Dict[str, Any]:
+    """Initialize code search for a repository.
+
+    Args:
+        repo_path: Path to the git repository
+        save_dir: Directory to save the search index
+        extensions: List of file extensions to include
+        embedding_model: Name or path of the embedding model to use
+        batch_size: Batch size for embedding generation
+
+    Returns:
+        Dictionary with status and message
+    """
+    try:
+        # Get all files from repo
+        documents = _get_files_from_repo(repo_path, extensions)
+        if not documents:
+            return {
+                'status': 'error',
+                'message': f'No files found in repository {repo_path}',
+            }
+
+        # Create and save index
+        index = CodeSearchIndex(embedding_model=embedding_model)
+        index.add_documents(documents, batch_size=batch_size)
+        index.save(save_dir)
+
+        return {
+            'status': 'success',
+            'message': f'Successfully indexed {len(documents)} files from {repo_path}',
+            'num_documents': len(documents),
+        }
+
+    except Exception as e:
+        logger.error(f"Error initializing code search: {e}")
+        return {
+            'status': 'error',
+            'message': f'Error initializing code search: {str(e)}',
+        }
+
+def search_code(save_dir: str, query: str, k: int = 5) -> Dict[str, Any]:
+    """Search code in an indexed repository.
+
+    Args:
+        save_dir: Directory containing the search index
+        query: Search query
+        k: Number of results to return
+
+    Returns:
+        Dictionary with status and search results
+    """
+    try:
+        # Load index
+        index = CodeSearchIndex.load(save_dir)
+
+        # Search
+        results = index.search(query, k=k)
+
+        return {'status': 'success', 'results': results}
+
+    except Exception as e:
+        logger.error(f"Error searching code: {e}")
+        return {'status': 'error', 'message': f'Error searching code: {str(e)}'}
 
 def code_search_tool(
     query: str,
@@ -166,6 +337,7 @@ def code_search_tool(
         repo_path: Path to the repository
         extensions: List of file extensions to include (e.g., [".py", ".js"])
         k: Number of results to return
+        mock_mode: If True, returns mock results without actually searching
         
     Returns:
         Dictionary with search results
@@ -208,102 +380,52 @@ def code_search_tool(
         logger.error(error_msg)
         return {"error": error_msg}
     
-    # Set default extensions if not provided
-    if extensions is None:
-        extensions = [".py"]  # Default to Python files
-    
-    # Get all files with the specified extensions
-    all_files = []
-    for ext in extensions:
-        pattern = os.path.join(repo_path, "**", f"*{ext}")
-        all_files.extend(glob.glob(pattern, recursive=True))
-    
-    logger.info(f"Found {len(all_files)} files with extensions {extensions}")
-    
-    # If no files found, return empty results
-    if not all_files:
+    # Create a temporary directory for the index
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Initialize code search (this will create and save the index)
+        init_result = initialize_code_search(
+            repo_path=repo_path,
+            save_dir=temp_dir,
+            extensions=extensions,
+            batch_size=32
+        )
+        
+        if init_result['status'] == 'error':
+            return {
+                "query": query,
+                "repo_path": repo_path,
+                "extensions": extensions,
+                "error": init_result['message']
+            }
+        
+        # Search the code
+        search_result = search_code(
+            save_dir=temp_dir,
+            query=query,
+            k=k
+        )
+        
+        if search_result['status'] == 'error':
+            return {
+                "query": query,
+                "repo_path": repo_path,
+                "extensions": extensions,
+                "error": search_result['message']
+            }
+        
+        # Transform results to match the expected output format
+        formatted_results = []
+        for result in search_result['results']:
+            formatted_results.append({
+                "file": result['path'],
+                "score": result['score'],
+                "content": result['content']
+            })
+        
         return {
             "query": query,
             "repo_path": repo_path,
             "extensions": extensions,
-            "results": []
+            "results": formatted_results
         }
-    
-    # Get embedding for the query
-    logger.info("Getting embedding for query...")
-    query_embedding = get_embedding(query)
-    logger.info("Got embedding for query")
-    
-    # Process each file
-    results = []
-    max_file_size = 100 * 1024  # 100KB max file size to process
-    
-    # Limit the number of files to process for testing
-    max_files_to_process = 50  # Limit to 50 files for testing
-    if len(all_files) > max_files_to_process:
-        logger.info(f"Limiting to {max_files_to_process} files for processing")
-        all_files = all_files[:max_files_to_process]
-    
-    processed_files = 0
-    for file_path in all_files:
-        processed_files += 1
-        if processed_files % 10 == 0:
-            logger.info(f"Processed {processed_files}/{len(all_files)} files")
-            
-        # Get relative path to the repository
-        rel_path = os.path.relpath(file_path, repo_path)
-        
-        # Skip hidden files and directories
-        if any(part.startswith('.') for part in rel_path.split(os.sep)):
-            continue
-        
-        # Skip files that are too large
-        file_size = os.path.getsize(file_path)
-        if file_size > max_file_size:
-            logger.warning(f"Skipping large file {rel_path} ({file_size} bytes)")
-            continue
-        
-        # Get file content
-        content = get_file_content(file_path)
-        
-        # Skip empty files
-        if not content.strip():
-            continue
-        
-        # Get embedding for the file content
-        try:
-            # For very large content, we'll just use the first part
-            # This helps avoid token limits and improves performance
-            max_content_length = 8000  # Characters to use for embedding
-            embedding_content = content[:max_content_length]
-            
-            logger.info(f"Getting embedding for file: {rel_path}")
-            file_embedding = get_embedding(embedding_content)
-            
-            # Calculate similarity
-            similarity = cosine_similarity(query_embedding, file_embedding)
-            logger.info(f"File {rel_path} has similarity score: {similarity}")
-            
-            # Add to results
-            results.append({
-                "file": rel_path,
-                "score": similarity,
-                "content": content
-            })
-        except Exception as e:
-            logger.error(f"Error processing file {rel_path}: {e}")
-    
-    # Sort results by similarity score (descending)
-    results.sort(key=lambda x: x["score"], reverse=True)
-    
-    # Return top k results
-    top_results = results[:k]
-    
-    logger.info(f"Returning {len(top_results)} results")
-    
-    return {
-        "query": query,
-        "repo_path": repo_path,
-        "extensions": extensions,
-        "results": top_results
-    }
