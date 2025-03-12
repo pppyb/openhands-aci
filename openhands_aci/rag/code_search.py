@@ -49,7 +49,7 @@ class CodeSearchAction(Action):
         self.extensions = extensions
         self.k = k
         self.thought = thought
-        self.id = str(uuid.uuid4())
+        self._id = str(uuid.uuid4())
 
 
 class CodeSearchObservation(Observation):
@@ -63,22 +63,23 @@ class CodeSearchObservation(Observation):
         self,
         content: Optional[str] = None,
         results: List[Dict[str, Any]] = None,
-        **kwargs
+        cause: Optional[str] = None
     ):
         """Initialize a code search observation.
         
         Args:
             content: Optional formatted content for display
             results: List of search results
+            cause: ID of the action that caused this observation
         """
-        super().__init__(**kwargs)
+        # Initialize with just the content parameter
+        super().__init__(content="" if content is None else content)
+        
         self.results = results or []
         
         # If content is not provided, generate it from results
         if content is None:
             self.content = self._format_results(self.results)
-        else:
-            self.content = content
     
     def _format_results(self, results: List[Dict[str, Any]]) -> str:
         """Format search results for display.
@@ -121,8 +122,7 @@ def execute_code_search(action: CodeSearchAction, mock_mode: bool = False) -> Co
     if not os.path.isdir(action.repo_path):
         return CodeSearchObservation(
             content=f"Error: Repository path '{action.repo_path}' is not a directory.",
-            results=[],
-            cause=action.id
+            results=[]
         )
     
     # Execute code search
@@ -142,19 +142,16 @@ def execute_code_search(action: CodeSearchAction, mock_mode: bool = False) -> Co
         if "error" in search_result:
             return CodeSearchObservation(
                 content=f"Error: {search_result['error']}",
-                results=[],
-                cause=action.id
+                results=[]
             )
         
         # Return observation with results
         return CodeSearchObservation(
             content=None,  # Will be auto-generated from results
-            results=search_result["results"],
-            cause=action.id
+            results=search_result["results"]
         )
     except Exception as e:
         return CodeSearchObservation(
             content=f"Error executing code search: {str(e)}",
-            results=[],
-            cause=action.id
+            results=[]
         )
