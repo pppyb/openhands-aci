@@ -33,6 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           poetry install --with code-search,pytorch-cpu
+          poetry install --with test
         env:
           POETRY_VIRTUALENVS_CREATE: false
       - name: Run tests

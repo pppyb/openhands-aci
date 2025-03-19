@@ -1,18 +1,26 @@
+import os
+import re
+import shutil
 import tempfile
-from collections import defaultdict
 from pathlib import Path
 from typing import Literal, get_args
+
+from binaryornot.check import is_binary
 
 from openhands_aci.linter import DefaultLinter
 from openhands_aci.tools.code_search_tool import code_search_tool
 from openhands_aci.utils.shell import run_shell_cmd
 
 from .config import SNIPPET_CONTEXT_WINDOW
+from .encoding import EncodingManager, with_encoding
 from .exceptions import (
     EditorToolParameterInvalidError,
     EditorToolParameterMissingError,
+    FileValidationError,
     ToolError,
 )
+from .history import FileHistoryManager
+from .prompts import DIRECTORY_CONTENT_TRUNCATED_NOTICE, FILE_CONTENT_TRUNCATED_NOTICE
 from .results import CLIResult, maybe_truncate
 
 Command = Literal[
@@ -40,10 +48,42 @@ class OHEditor:
     """
 
     TOOL_NAME = 'oh_editor'
+    MAX_FILE_SIZE_MB = 10  # Maximum file size in MB
 
-    def __init__(self):
-        self._file_history: dict[Path, list[str]] = defaultdict(list)
+    def __init__(
+        self,
+        max_file_size_mb: int | None = None,
+        workspace_root: str | None = None,
+    ):
+        """Initialize the editor.
+
+        Args:
+            max_file_size_mb: Maximum file size in MB. If None, uses the default MAX_FILE_SIZE_MB.
+            workspace_root: Root directory that serves as the current working directory for relative path
+                           suggestions. Must be an absolute path. If None, no path suggestions will be
+                           provided for relative paths.
+            workspace_root: Root directory that serves as the current working directory for relative path
+                           suggestions. Must be an absolute path. If None, no path suggestions will be
+                           provided for relative paths.
+        """
         self._linter = DefaultLinter()
+        self._history_manager = FileHistoryManager(max_history_per_file=10)
+        self._max_file_size = (
+            (max_file_size_mb or self.MAX_FILE_SIZE_MB) * 1024 * 1024
+        )  # Convert to bytes
+        # Initialize encoding manager
+        self._encoding_manager = EncodingManager()
+        # Set cwd (current working directory) if workspace_root is provided
+        if workspace_root is not None:
+            workspace_path = Path(workspace_root)
+            # Ensure workspace_root is an absolute path
+            if not workspace_path.is_absolute():
+                raise ValueError(
+                    f'workspace_root must be an absolute path, got: {workspace_root}'
+                )
+            self._cwd = workspace_path
+        else:
+            self._cwd = None  # type: ignore
 
     def __call__(
         self,
@@ -106,10 +146,10 @@ class OHEditor:
         if command == 'view':
             return self.view(_path, view_range)
         elif command == 'create':
-            if not file_text:
+            if file_text is None:
                 raise EditorToolParameterMissingError(command, 'file_text')
             self.write_file(_path, file_text)
-            self._file_history[_path].append(file_text)
+            self._history_manager.add_history(_path, file_text)
             return CLIResult(
                 path=str(_path),
                 new_content=file_text,
@@ -117,7 +157,7 @@ class OHEditor:
                 output=f'File created successfully at: {_path}',
             )
         elif command == 'str_replace':
-            if not old_str:
+            if old_str is None:
                 raise EditorToolParameterMissingError(command, 'old_str')
             if new_str == old_str:
                 raise EditorToolParameterInvalidError(
@@ -129,7 +169,7 @@ class OHEditor:
         elif command == 'insert':
             if insert_line is None:
                 raise EditorToolParameterMissingError(command, 'insert_line')
-            if not new_str:
+            if new_str is None:
                 raise EditorToolParameterMissingError(command, 'new_str')
             return self.insert(_path, insert_line, new_str, enable_linting)
         elif command == 'undo_edit':
@@ -139,52 +179,89 @@ class OHEditor:
             f'Unrecognized command {command}. The allowed commands for the {self.TOOL_NAME} tool are: {", ".join(get_args(Command))}'
         )
 
+    @with_encoding
+    def _count_lines(self, path: Path, encoding: str = 'utf-8') -> int:
+        """
+        Count the number of lines in a file safely.
+
+        Args:
+            path: Path to the file
+            encoding: The encoding to use when reading the file (auto-detected by decorator)
+
+        Returns:
+            The number of lines in the file
+        """
+        with open(path, encoding=encoding) as f:
+            return sum(1 for _ in f)
+
+    @with_encoding
     def str_replace(
-        self, path: Path, old_str: str, new_str: str | None, enable_linting: bool
+        self,
+        path: Path,
+        old_str: str,
+        new_str: str | None,
+        enable_linting: bool,
+        encoding: str = 'utf-8',
     ) -> CLIResult:
         """
         Implement the str_replace command, which replaces old_str with new_str in the file content.
+
+        Args:
+            path: Path to the file
+            old_str: String to replace
+            new_str: Replacement string
+            enable_linting: Whether to run linting on the changes
+            encoding: The encoding to use (auto-detected by decorator)
         """
-        file_content = self.read_file(path).expandtabs()
+        self.validate_file(path)
         old_str = old_str.expandtabs()
         new_str = new_str.expandtabs() if new_str is not None else ''
 
-        # Check if old_str is unique in the file
-        occurrences = file_content.count(old_str)
-        if occurrences == 0:
+        # Read the entire file first to handle both single-line and multi-line replacements
+        file_content = self.read_file(path).expandtabs()
+
+        # Find all occurrences using regex
+        # Escape special regex characters in old_str to match it literally
+        pattern = re.escape(old_str)
+        occurrences = [
+            (
+                file_content.count('\n', 0, match.start()) + 1,  # line number
+                match.group(),  # matched text
+                match.start(),  # start position
+            )
+            for match in re.finditer(pattern, file_content)
+        ]
+
+        if not occurrences:
             raise ToolError(
                 f'No replacement was performed, old_str `{old_str}` did not appear verbatim in {path}.'
             )
-        if occurrences > 1:
-            # Find starting line numbers for each occurrence
-            line_numbers = []
-            start_idx = 0
-            while True:
-                idx = file_content.find(old_str, start_idx)
-                if idx == -1:
-                    break
-                # Count newlines before this occurrence to get the line number
-                line_num = file_content.count('\n', 0, idx) + 1
-                line_numbers.append(line_num)
-                start_idx = idx + 1
+        if len(occurrences) > 1:
+            line_numbers = sorted(set(line for line, _, _ in occurrences))
             raise ToolError(
                 f'No replacement was performed. Multiple occurrences of old_str `{old_str}` in lines {line_numbers}. Please ensure it is unique.'
             )
 
-        # Replace old_str with new_str
-        new_file_content = file_content.replace(old_str, new_str)
+        # We found exactly one occurrence
+        replacement_line, matched_text, idx = occurrences[0]
+
+        # Create new content by replacing just the matched text
+        new_file_content = (
+            file_content[:idx] + new_str + file_content[idx + len(matched_text) :]
+        )
 
         # Write the new content to the file
         self.write_file(path, new_file_content)
 
         # Save the content to history
-        self._file_history[path].append(file_content)
+        self._history_manager.add_history(path, file_content)
 
         # Create a snippet of the edited section
-        replacement_line = file_content.split(old_str)[0].count('\n')
         start_line = max(0, replacement_line - SNIPPET_CONTEXT_WINDOW)
         end_line = replacement_line + SNIPPET_CONTEXT_WINDOW + new_str.count('\n')
-        snippet = '\n'.join(new_file_content.split('\n')[start_line : end_line + 1])
+
+        # Read just the snippet range
+        snippet = self.read_file(path, start_line=start_line, end_line=end_line)
 
         # Prepare the success message
         success_message = f'The file {path} has been edited. '
@@ -218,11 +295,39 @@ class OHEditor:
                     'The `view_range` parameter is not allowed when `path` points to a directory.',
                 )
 
+            # First count hidden files/dirs in current directory only
+            # -mindepth 1 excludes . and .. automatically
+            _, hidden_stdout, _ = run_shell_cmd(
+                rf"find -L {path} -mindepth 1 -maxdepth 1 -name '.*'"
+            )
+            hidden_count = (
+                len(hidden_stdout.strip().split('\n')) if hidden_stdout.strip() else 0
+            )
+
+            # Then get files/dirs up to 2 levels deep, excluding hidden entries at both depth 1 and 2
             _, stdout, stderr = run_shell_cmd(
-                rf"find -L {path} -maxdepth 2 -not -path '*/\.*'"
+                rf"find -L {path} -maxdepth 2 -not \( -path '{path}/\.*' -o -path '{path}/*/\.*' \) | sort",
+                truncate_notice=DIRECTORY_CONTENT_TRUNCATED_NOTICE,
             )
             if not stderr:
-                stdout = f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{stdout}\n"
+                # Add trailing slashes to directories
+                paths = stdout.strip().split('\n') if stdout.strip() else []
+                formatted_paths = []
+                for p in paths:
+                    if Path(p).is_dir():
+                        formatted_paths.append(f'{p}/')
+                    else:
+                        formatted_paths.append(p)
+
+                msg = [
+                    f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n"
+                    + '\n'.join(formatted_paths)
+                ]
+                if hidden_count > 0:
+                    msg.append(
+                        f"\n{hidden_count} hidden files/directories in this directory are excluded. You can use 'ls -la {path}' to see them."
+                    )
+                stdout = '\n'.join(msg)
             return CLIResult(
                 output=stdout,
                 error=stderr,
@@ -230,11 +335,17 @@ class OHEditor:
                 prev_exist=True,
             )
 
-        file_content = self.read_file(path)
+        # Validate file and count lines
+        self.validate_file(path)
+        num_lines = self._count_lines(path)
+
         start_line = 1
         if not view_range:
+            file_content = self.read_file(path)
+            output = self._make_output(file_content, str(path), start_line)
+
             return CLIResult(
-                output=self._make_output(file_content, str(path), start_line),
+                output=output,
                 path=str(path),
                 prev_exist=True,
             )
@@ -246,8 +357,6 @@ class OHEditor:
                 'It should be a list of two integers.',
             )
 
-        file_content_lines = file_content.split('\n')
-        num_lines = len(file_content_lines)
         start_line, end_line = view_range
         if start_line < 1 or start_line > num_lines:
             raise EditorToolParameterInvalidError(
@@ -271,40 +380,59 @@ class OHEditor:
             )
 
         if end_line == -1:
-            file_content = '\n'.join(file_content_lines[start_line - 1 :])
-        else:
-            file_content = '\n'.join(file_content_lines[start_line - 1 : end_line])
+            end_line = num_lines
+
+        file_content = self.read_file(path, start_line=start_line, end_line=end_line)
+
+        # Get the detected encoding
+        output = self._make_output(file_content, str(path), start_line)
+
         return CLIResult(
             path=str(path),
-            output=self._make_output(file_content, str(path), start_line),
+            output=output,
             prev_exist=True,
         )
 
-    def write_file(self, path: Path, file_text: str) -> None:
+    @with_encoding
+    def write_file(self, path: Path, file_text: str, encoding: str = 'utf-8') -> None:
         """
         Write the content of a file to a given path; raise a ToolError if an error occurs.
+
+        Args:
+            path: Path to the file to write
+            file_text: Content to write to the file
+            encoding: The encoding to use when writing the file (auto-detected by decorator)
         """
+        self.validate_file(path)
         try:
-            path.write_text(file_text)
+            # Use open with encoding instead of path.write_text
+            with open(path, 'w', encoding=encoding) as f:
+                f.write(file_text)
         except Exception as e:
             raise ToolError(f'Ran into {e} while trying to write to {path}') from None
 
+    @with_encoding
     def insert(
-        self, path: Path, insert_line: int, new_str: str, enable_linting: bool
+        self,
+        path: Path,
+        insert_line: int,
+        new_str: str,
+        enable_linting: bool,
+        encoding: str = 'utf-8',
     ) -> CLIResult:
         """
         Implement the insert command, which inserts new_str at the specified line in the file content.
+
+        Args:
+            path: Path to the file
+            insert_line: Line number where to insert the new content
+            new_str: Content to insert
+            enable_linting: Whether to run linting on the changes
+            encoding: The encoding to use (auto-detected by decorator)
         """
-        try:
-            file_text = self.read_file(path)
-        except Exception as e:
-            raise ToolError(f'Ran into {e} while trying to read {path}') from None
-
-        file_text = file_text.expandtabs()
-        new_str = new_str.expandtabs()
-
-        file_text_lines = file_text.split('\n')
-        num_lines = len(file_text_lines)
+        # Validate file and count lines
+        self.validate_file(path)
+        num_lines = self._count_lines(path)
 
         if insert_line < 0 or insert_line > num_lines:
             raise EditorToolParameterInvalidError(
@@ -313,24 +441,51 @@ class OHEditor:
                 f'It should be within the range of lines of the file: {[0, num_lines]}',
             )
 
+        new_str = new_str.expandtabs()
         new_str_lines = new_str.split('\n')
-        new_file_text_lines = (
-            file_text_lines[:insert_line]
-            + new_str_lines
-            + file_text_lines[insert_line:]
-        )
-        snippet_lines = (
-            file_text_lines[max(0, insert_line - SNIPPET_CONTEXT_WINDOW) : insert_line]
-            + new_str_lines
-            + file_text_lines[
-                insert_line : min(num_lines, insert_line + SNIPPET_CONTEXT_WINDOW)
-            ]
-        )
-        new_file_text = '\n'.join(new_file_text_lines)
-        snippet = '\n'.join(snippet_lines)
 
-        self.write_file(path, new_file_text)
-        self._file_history[path].append(file_text)
+        # Create temporary file for the new content
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding=encoding, delete=False
+        ) as temp_file:
+            # Copy lines before insert point and save them for history
+            history_lines = []
+            with open(path, 'r', encoding=encoding) as f:
+                for i, line in enumerate(f, 1):
+                    if i > insert_line:
+                        break
+                    temp_file.write(line.expandtabs())
+                    history_lines.append(line)
+
+            # Insert new content
+            for line in new_str_lines:
+                temp_file.write(line + '\n')
+
+            # Copy remaining lines and save them for history
+            with open(path, 'r', encoding=encoding) as f:
+                for i, line in enumerate(f, 1):
+                    if i <= insert_line:
+                        continue
+                    temp_file.write(line.expandtabs())
+                    history_lines.append(line)
+
+        # Move temporary file to original location
+        shutil.move(temp_file.name, path)
+
+        # Read just the snippet range
+        start_line = max(1, insert_line - SNIPPET_CONTEXT_WINDOW)
+        end_line = min(
+            num_lines + len(new_str_lines),
+            insert_line + SNIPPET_CONTEXT_WINDOW + len(new_str_lines),
+        )
+        snippet = self.read_file(path, start_line=start_line, end_line=end_line)
+
+        # Save history - we already have the lines in memory
+        file_text = ''.join(history_lines)
+        self._history_manager.add_history(path, file_text)
+
+        # Read new content for result
+        new_file_text = self.read_file(path)
 
         success_message = f'The file {path} has been edited. '
         success_message += self._make_output(
@@ -356,15 +511,33 @@ class OHEditor:
     def validate_path(self, command: Command, path: Path) -> None:
         """
         Check that the path/command combination is valid.
+
+        Validates:
+        1. Path is absolute
+        2. Path and command are compatible
+
+        Validates:
+        1. Path is absolute
+        2. Path and command are compatible
         """
         # Check if its an absolute path
         if not path.is_absolute():
-            suggested_path = Path('') / path
+            suggestion_message = (
+                'The path should be an absolute path, starting with `/`.'
+            )
+
+            # Only suggest the absolute path if cwd is provided and the path exists
+            if self._cwd is not None:
+                suggested_path = self._cwd / path
+                if suggested_path.exists():
+                    suggestion_message += f' Maybe you meant {suggested_path}?'
+
             raise EditorToolParameterInvalidError(
                 'path',
                 path,
-                f'The path should be an absolute path, starting with `/`. Maybe you meant {suggested_path}?',
+                suggestion_message,
             )
+
         # Check if path and command are compatible
         if command == 'create' and path.exists():
             raise EditorToolParameterInvalidError(
@@ -389,11 +562,11 @@ class OHEditor:
         """
         Implement the undo_edit command.
         """
-        if not self._file_history[path]:
+        current_text = self.read_file(path).expandtabs()
+        old_text = self._history_manager.pop_last_history(path)
+        if old_text is None:
             raise ToolError(f'No edit history found for {path}.')
 
-        current_text = self.read_file(path).expandtabs()
-        old_text = self._file_history[path].pop()
         self.write_file(path, old_text)
 
         return CLIResult(
@@ -404,12 +577,73 @@ class OHEditor:
             new_content=old_text,
         )
 
-    def read_file(self, path: Path) -> str:
+    def validate_file(self, path: Path) -> None:
+        """
+        Validate a file for reading or editing operations.
+
+        Args:
+            path: Path to the file to validate
+
+        Raises:
+            FileValidationError: If the file fails validation
+        """
+        # Skip validation for directories or non-existent files (for create command)
+        if not path.exists() or not path.is_file():
+            return
+
+        # Check file size
+        file_size = os.path.getsize(path)
+        max_size = self._max_file_size
+        if file_size > max_size:
+            raise FileValidationError(
+                path=str(path),
+                reason=f'File is too large ({file_size / 1024 / 1024:.1f}MB). Maximum allowed size is {int(max_size / 1024 / 1024)}MB.',
+            )
+
+        # Check file type
+        if is_binary(str(path)):
+            raise FileValidationError(
+                path=str(path),
+                reason='File appears to be binary. Only text files can be edited.',
+            )
+
+    @with_encoding
+    def read_file(
+        self,
+        path: Path,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        encoding: str = 'utf-8',  # Default will be overridden by decorator
+    ) -> str:
         """
         Read the content of a file from a given path; raise a ToolError if an error occurs.
+
+        Args:
+            path: Path to the file to read
+            start_line: Optional start line number (1-based). If provided with end_line, only reads that range.
+            end_line: Optional end line number (1-based). Must be provided with start_line.
+            encoding: The encoding to use when reading the file (auto-detected by decorator)
         """
+        self.validate_file(path)
         try:
-            return path.read_text()
+            if start_line is not None and end_line is not None:
+                # Read only the specified line range
+                lines = []
+                with open(path, 'r', encoding=encoding) as f:
+                    for i, line in enumerate(f, 1):
+                        if i > end_line:
+                            break
+                        if i >= start_line:
+                            lines.append(line)
+                return ''.join(lines)
+            elif start_line is not None or end_line is not None:
+                raise ValueError(
+                    'Both start_line and end_line must be provided together'
+                )
+            else:
+                # Use line-by-line reading to avoid loading entire file into memory
+                with open(path, 'r', encoding=encoding) as f:
+                    return ''.join(f)
         except Exception as e:
             raise ToolError(f'Ran into {e} while trying to read {path}') from None
 
@@ -423,7 +657,9 @@ class OHEditor:
         """
         Generate output for the CLI based on the content of a code snippet.
         """
-        snippet_content = maybe_truncate(snippet_content)
+        snippet_content = maybe_truncate(
+            snippet_content, truncate_notice=FILE_CONTENT_TRUNCATED_NOTICE
+        )
         if expand_tabs:
             snippet_content = snippet_content.expandtabs()
 
