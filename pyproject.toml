@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "openhands-aci"
-version = "0.2.5"
+version = "0.2.6"
 description = "An Agent-Computer Interface (ACI) designed for software development agents OpenHands."
 authors = ["OpenHands"]
 license = "MIT"
@@ -26,9 +26,30 @@ grep-ast = "0.3.3"
 flake8 = "*"
 whatthepatch = "^1.0.6"
 binaryornot = "^0.4.4"
+chardet = "^5.0.0"
+cachetools = "^5.5.2"
 
 
 
+
+[tool.poetry.group.code-search]
+optional = true
+
+[tool.poetry.group.code-search.dependencies]
+sentence-transformers = "^2.2.2"
+faiss-cpu = "^1.7.4"
+
+[tool.poetry.group.pytorch-cpu]
+optional = true
+
+[tool.poetry.group.pytorch-cpu.dependencies]
+torch = { version = "^2.1.0+cpu", source = "pytorch" }
+
+[tool.poetry.group.pytorch]
+optional = true
+
+[tool.poetry.group.pytorch.dependencies]
+torch = "^2.1.0"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -39,6 +60,11 @@ pre-commit = "^4.0.1"
 [tool.poetry.group.test.dependencies]
 pytest = "^8.3.3"
 psutil = "^5.9.8"
+
+[[tool.poetry.source]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
 
 [build-system]
 build-backend = "poetry.core.masonry.api"
