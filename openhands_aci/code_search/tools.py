@@ -21,11 +21,13 @@ def _get_files_from_repo(
     Returns:
         List of document dictionaries with 'id' and 'content' keys.
     """
+    # Check if it's a git repository, but don't require it
+    is_git_repo = True
     try:
-        # Verify that it's a git repository
         _ = Repo(repo_path)
     except InvalidGitRepositoryError:
-        raise ValueError(f'{repo_path} is not a valid git repository')
+        is_git_repo = False
+        print(f"Warning: {repo_path} is not a git repository. Proceeding without git features.")
 
     documents = []
     repo_path_obj = Path(repo_path)
