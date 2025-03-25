@@ -32,7 +32,11 @@ jobs:
           echo 'export PATH="$HOME/.local/bin:$PATH"' >> $GITHUB_ENV
       - name: Install dependencies
         run: |
+<<<<<<< HEAD
           poetry install --with code-search,pytorch-cpu
+=======
+          poetry install --with test
+>>>>>>> upstream/main
         env:
           POETRY_VIRTUALENVS_CREATE: false
       - name: Run tests
